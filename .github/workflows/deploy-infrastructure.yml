@@ -1,0 +1,111 @@
+name: Deploy FairWork Infrastructure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fairwork-infrastructure-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: fairwork-infrastructure
+  TEMPLATE_FILE: fairwork-stack1-updated.yaml
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy Stack 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Download the repository files onto the GitHub Actions runner
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Configure the temporary AWS Academy credentials
+      # -----------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # -----------------------------------------------------------------------
+      # Confirm that GitHub Actions is connected to the expected AWS account
+      # -----------------------------------------------------------------------
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      # -----------------------------------------------------------------------
+      # Confirm that the CloudFormation file exists
+      # -----------------------------------------------------------------------
+      - name: Check template file
+        run: |
+          echo "Repository files:"
+          ls -la
+
+          if [ ! -f "${TEMPLATE_FILE}" ]; then
+            echo "ERROR: ${TEMPLATE_FILE} was not found."
+            exit 1
+          fi
+
+          echo "Template found: ${TEMPLATE_FILE}"
+
+      # -----------------------------------------------------------------------
+      # Check the basic CloudFormation syntax before deployment
+      # -----------------------------------------------------------------------
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body "file://${TEMPLATE_FILE}" \
+            --region "${AWS_REGION}"
+
+      # -----------------------------------------------------------------------
+      # Create or update the FairWork Pulse infrastructure stack
+      # -----------------------------------------------------------------------
+      - name: Deploy infrastructure stack
+        run: |
+          set -euo pipefail
+
+          aws cloudformation deploy \
+            --stack-name "${STACK_NAME}" \
+            --template-file "${TEMPLATE_FILE}" \
+            --region "${AWS_REGION}" \
+            --parameter-overrides \
+              ProjectName=fairwork-pulse \
+              NatGatewayMode=Single \
+              CreateInterfaceEndpoints=false \
+              DatabaseName=fairworkpulse \
+              DatabaseUsername=fwadmin \
+              DatabaseInstanceClass=db.t3.micro \
+              DatabaseAllocatedStorage=20 \
+              BackupRetentionDays=7 \
+              CreateReadReplica=false \
+              EnableDeletionProtection=false \
+            --tags \
+              Project=FairWorkPulse \
+              Environment=PoC \
+              ManagedBy=CloudFormation \
+            --no-fail-on-empty-changeset
+
+      # -----------------------------------------------------------------------
+      # Display values that Stack 2 will import
+      # -----------------------------------------------------------------------
+      - name: Display stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" \
+            --output table
