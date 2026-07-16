@@ -1,0 +1,997 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  FairWork Pulse Stack 1. Creates the VPC, public/private/isolated subnets,
+  Internet Gateway, NAT Gateway routing, security groups, a customer-managed
+  KMS key, a private S3 bucket for Lambda deployment packages, optional
+  Secrets Manager and KMS interface endpoints, an encrypted Secrets Manager
+  database secret, an encrypted RDS MySQL primary database, and an optional
+  read replica. API Gateway, Cognito, Lambda, SQS, SNS, SES, EventBridge, and
+  Amplify belong in Stack 2.
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: fairwork-pulse
+    AllowedPattern: '^[a-z][a-z0-9-]{2,30}$'
+    ConstraintDescription: Use 3-31 lowercase letters, numbers, or hyphens.
+
+  NatGatewayMode:
+    Type: String
+    Default: Single
+    AllowedValues:
+      - Single
+      - PerAZ
+    Description: >
+      Single creates one NAT Gateway to reduce PoC cost. PerAZ creates one
+      NAT Gateway in each Availability Zone.
+
+  CreateInterfaceEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Create private interface endpoints for Secrets Manager and KMS.
+      Interface endpoints have hourly charges.
+
+  DatabaseName:
+    Type: String
+    Default: fairworkpulse
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]{0,63}$'
+
+  DatabaseUsername:
+    Type: String
+    Default: fwadmin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,15}$'
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: Change this only if the AWS Academy lab rejects db.t3.micro.
+
+  DatabaseAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+  CreateReadReplica:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableDeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Keep false in AWS Academy so the stack can be removed. Use true only
+      for a long-lived environment.
+
+Conditions:
+
+  UseTwoNatGateways: !Equals
+    - !Ref NatGatewayMode
+    - PerAZ
+
+  MakeInterfaceEndpoints: !Equals
+    - !Ref CreateInterfaceEndpoints
+    - 'true'
+
+  MakeReadReplica: !Equals
+    - !Ref CreateReadReplica
+    - 'true'
+
+  ProtectDatabase: !Equals
+    - !Ref EnableDeletionProtection
+    - 'true'
+
+Resources:
+
+  # ===========================================================================
+  # CUSTOMER-MANAGED KMS KEY
+  # ===========================================================================
+
+  FairWorkKmsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Customer-managed encryption key for FairWork Pulse
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: false
+      PendingWindowInDays: 30
+
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Sub '${ProjectName}-key-policy'
+
+        Statement:
+
+          - Sid: EnableAccountPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: AllowLabRoleAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:DeleteAlias
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:CancelKeyDeletion
+              - kms:RotateKeyOnDemand
+            Resource: '*'
+
+          - Sid: AllowLabRoleKeyUsage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+          - Sid: AllowLabRoleAwsResourceGrants
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+            Action:
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:RevokeGrant
+            Resource: '*'
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: 'true'
+
+          - Sid: PreventLabRoleSchedulingKeyDeletion
+            Effect: Deny
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+            Action:
+              - kms:ScheduleKeyDeletion
+            Resource: '*'
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-kms-key'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FairWorkKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-key'
+      TargetKeyId: !Ref FairWorkKmsKey
+
+  # ===========================================================================
+  # VPC AND SUBNETS
+  # ===========================================================================
+
+  FairWorkVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-internet-gateway'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.1.0/24
+
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-a'
+        - Key: Tier
+          Value: Public
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.2.0/24
+
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-b'
+        - Key: Tier
+          Value: Public
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.3.0/24
+
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-app-subnet-a'
+        - Key: Tier
+          Value: Application
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.4.0/24
+
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-app-subnet-b'
+        - Key: Tier
+          Value: Application
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.5.0/24
+
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-db-subnet-a'
+        - Key: Tier
+          Value: Database
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateDbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      CidrBlock: 10.0.6.0/24
+
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+      MapPublicIpOnLaunch: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-db-subnet-b'
+        - Key: Tier
+          Value: Database
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===========================================================================
+  # PUBLIC ROUTING
+  # ===========================================================================
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FairWorkVpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-route-table'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ===========================================================================
+  # NAT GATEWAYS
+  # ===========================================================================
+
+  NatElasticIpA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+
+    Properties:
+      Domain: vpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-elastic-ip-a'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatElasticIpA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gateway-a'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatElasticIpB:
+    Condition: UseTwoNatGateways
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+
+    Properties:
+      Domain: vpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-elastic-ip-b'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NatGatewayB:
+    Condition: UseTwoNatGateways
+    Type: AWS::EC2::NatGateway
+
+    Properties:
+      AllocationId: !GetAtt NatElasticIpB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gateway-b'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ===========================================================================
+  # PRIVATE APPLICATION ROUTING
+  # ===========================================================================
+
+  PrivateAppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FairWorkVpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-app-route-table-a'
+
+  PrivateAppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FairWorkVpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-app-route-table-b'
+
+  PrivateAppDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateAppDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+
+      NatGatewayId: !If
+        - UseTwoNatGateways
+        - !Ref NatGatewayB
+        - !Ref NatGatewayA
+
+  PrivateAppSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateAppRouteTableA
+
+  PrivateAppSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateAppRouteTableB
+
+  # ===========================================================================
+  # ISOLATED DATABASE ROUTING
+  # No default internet route is added to this route table.
+  # ===========================================================================
+
+  PrivateDbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref FairWorkVpc
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-db-route-table'
+
+  PrivateDbSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetA
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  PrivateDbSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetB
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  # ===========================================================================
+  # SECURITY GROUPS
+  # ===========================================================================
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound access for FairWork Pulse Lambda functions
+      VpcId: !Ref FairWorkVpc
+
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound connections
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-security-group'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL only from the Lambda security group
+      VpcId: !Ref FairWorkVpc
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: MySQL from FairWork Pulse Lambda functions
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-security-group'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EndpointSecurityGroup:
+    Condition: MakeInterfaceEndpoints
+    Type: AWS::EC2::SecurityGroup
+
+    Properties:
+      GroupDescription: Allow HTTPS from Lambda to interface VPC endpoints
+      VpcId: !Ref FairWorkVpc
+
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: HTTPS from FairWork Pulse Lambda functions
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-endpoint-security-group'
+
+  # ===========================================================================
+  # OPTIONAL INTERFACE VPC ENDPOINTS
+  # ===========================================================================
+
+  SecretsManagerVpcEndpoint:
+    Condition: MakeInterfaceEndpoints
+    Type: AWS::EC2::VPCEndpoint
+
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      PrivateDnsEnabled: true
+
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-secrets-manager-endpoint'
+
+  KmsVpcEndpoint:
+    Condition: MakeInterfaceEndpoints
+    Type: AWS::EC2::VPCEndpoint
+
+    Properties:
+      VpcId: !Ref FairWorkVpc
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.kms'
+      PrivateDnsEnabled: true
+
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-kms-endpoint'
+
+  # ===========================================================================
+  # S3 BUCKET FOR SEPARATELY PACKAGED LAMBDA CODE
+  # ===========================================================================
+
+  LambdaArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: false
+
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+      VersioningConfiguration:
+        Status: Enabled
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-artifacts'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+
+    Properties:
+      Bucket: !Ref LambdaArtifactBucket
+
+      PolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+
+          - Sid: AllowLabRoleArtifactAccess
+            Effect: Allow
+
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+
+            Resource:
+              - !GetAtt LambdaArtifactBucket.Arn
+
+          - Sid: AllowLabRoleArtifactObjectAccess
+            Effect: Allow
+
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+
+            Resource:
+              - !Sub '${LambdaArtifactBucket.Arn}/*'
+
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+
+            Resource:
+              - !GetAtt LambdaArtifactBucket.Arn
+              - !Sub '${LambdaArtifactBucket.Arn}/*'
+
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ===========================================================================
+  # DATABASE SECRET
+  # ===========================================================================
+
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+
+    Properties:
+      Description: FairWork Pulse MySQL administrator credentials
+      KmsKeyId: !GetAtt FairWorkKmsKey.Arn
+
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DatabaseUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: "\"@/ "
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-secret'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DatabaseSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      BlockPublicPolicy: true
+
+      ResourcePolicy:
+        Version: '2012-10-17'
+
+        Statement:
+
+          - Sid: AllowLabRoleReadDatabaseSecret
+            Effect: Allow
+
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+
+            Resource: '*'
+
+  # ===========================================================================
+  # RDS MYSQL DATABASE
+  # ===========================================================================
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+
+    Properties:
+      DBSubnetGroupDescription: FairWork Pulse isolated database subnet group
+
+      SubnetIds:
+        - !Ref PrivateDbSubnetA
+        - !Ref PrivateDbSubnetB
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-subnet-group'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrimaryDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-mysql-primary'
+      Engine: mysql
+      DBInstanceClass: !Ref DatabaseInstanceClass
+
+      AllocatedStorage: !Ref DatabaseAllocatedStorage
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt FairWorkKmsKey.Arn
+
+      DBName: !Ref DatabaseName
+
+      MasterUsername: !Sub
+        - '{{resolve:secretsmanager:${SecretArn}:SecretString:username}}'
+        - SecretArn: !Ref DatabaseSecret
+
+      MasterUserPassword: !Sub
+        - '{{resolve:secretsmanager:${SecretArn}:SecretString:password}}'
+        - SecretArn: !Ref DatabaseSecret
+
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+      PubliclyAccessible: false
+      MultiAZ: false
+
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+      DeletionProtection: !If
+        - ProtectDatabase
+        - true
+        - false
+
+      EnablePerformanceInsights: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-primary'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DatabaseSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      TargetId: !Ref PrimaryDatabase
+      TargetType: AWS::RDS::DBInstance
+
+  # ===========================================================================
+  # OPTIONAL READ REPLICA
+  # ===========================================================================
+
+  ReadReplica:
+    Condition: MakeReadReplica
+    Type: AWS::RDS::DBInstance
+
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-mysql-read-replica'
+      SourceDBInstanceIdentifier: !Ref PrimaryDatabase
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-mysql-read-replica'
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+
+  AwsRegion:
+    Description: Region in which Stack 1 was deployed.
+    Value: !Ref AWS::Region
+
+    Export:
+      Name: !Sub '${AWS::StackName}-AwsRegion'
+
+  LabRoleArn:
+    Description: Existing AWS Academy role used by Stack 2 Lambda functions.
+    Value: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/LabRole'
+
+    Export:
+      Name: !Sub '${AWS::StackName}-LabRoleArn'
+
+  KmsKeyArn:
+    Description: ARN of the FairWork Pulse customer-managed KMS key.
+    Value: !GetAtt FairWorkKmsKey.Arn
+
+    Export:
+      Name: !Sub '${AWS::StackName}-KmsKeyArn'
+
+  KmsKeyAlias:
+    Description: Alias of the FairWork Pulse customer-managed KMS key.
+    Value: !Ref FairWorkKmsAlias
+
+    Export:
+      Name: !Sub '${AWS::StackName}-KmsKeyAlias'
+
+  VpcId:
+    Value: !Ref FairWorkVpc
+
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetAId:
+    Value: !Ref PublicSubnetA
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetAId'
+
+  PublicSubnetBId:
+    Value: !Ref PublicSubnetB
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetBId'
+
+  PrivateAppSubnetAId:
+    Value: !Ref PrivateAppSubnetA
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnetAId'
+
+  PrivateAppSubnetBId:
+    Value: !Ref PrivateAppSubnetB
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateAppSubnetBId'
+
+  PrivateDbSubnetAId:
+    Value: !Ref PrivateDbSubnetA
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDbSubnetAId'
+
+  PrivateDbSubnetBId:
+    Value: !Ref PrivateDbSubnetB
+
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateDbSubnetBId'
+
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSecurityGroupId'
+
+  DatabaseSecurityGroupId:
+    Value: !Ref DatabaseSecurityGroup
+
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroupId'
+
+  LambdaArtifactBucketName:
+    Description: Bucket used to upload the API, worker, and analytics ZIP files.
+    Value: !Ref LambdaArtifactBucket
+
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArtifactBucketName'
+
+  DatabaseEndpoint:
+    Value: !GetAtt PrimaryDatabase.Endpoint.Address
+
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Value: !GetAtt PrimaryDatabase.Endpoint.Port
+
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  DatabaseName:
+    Value: !Ref DatabaseName
+
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+
+  DatabaseSecretArn:
+    Value: !Ref DatabaseSecret
+
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecretArn'
+
+  ReadReplicaEndpoint:
+    Condition: MakeReadReplica
+    Value: !GetAtt ReadReplica.Endpoint.Address
+
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadReplicaEndpoint'
