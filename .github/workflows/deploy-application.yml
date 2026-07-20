@@ -1,4 +1,4 @@
-name: Deploy FairWork Application
+name: Deploy FairWork 602AZ Application PoC
 
 on:
   workflow_dispatch:
@@ -7,27 +7,28 @@ permissions:
   contents: read
 
 concurrency:
-  group: fairwork-application-${{ github.ref }}
+  group: fairwork-602az-application-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-east-1
   INFRASTRUCTURE_STACK_NAME: fairwork-infrastructure
-  APPLICATION_STACK_NAME: fairwork-application
-  TEMPLATE_FILE: fairwork-stack2-application.yaml
+  APPLICATION_STACK_NAME: fairwork-application-602az
+  TEMPLATE_FILE: fairwork-stack2-602az.yaml
   LAMBDA_RUNTIME: nodejs18.x
+  ALLOWED_ORIGIN: http://localhost:3000
 
 jobs:
   deploy-application:
-    name: Deploy Stack 2
+    name: Package and deploy Stack 2
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: '18'
@@ -41,11 +42,32 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
-      - name: Verify AWS identity
+      - name: Verify AWS identity and Stack 1
         run: |
+          set -euo pipefail
+
           aws sts get-caller-identity
 
-      - name: Check required repository files
+          aws cloudformation describe-stacks \
+            --stack-name "${INFRASTRUCTURE_STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'Stacks[0].[StackName,StackStatus]' \
+            --output table
+
+          REPLICA_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name "${INFRASTRUCTURE_STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='ReadReplicaEndpoint'].OutputValue | [0]" \
+            --output text)
+
+          if [ -z "${REPLICA_ENDPOINT}" ] || [ "${REPLICA_ENDPOINT}" = "None" ]; then
+            echo "ERROR: Stack 1 does not export ReadReplicaEndpoint."
+            exit 1
+          fi
+
+          echo "Read replica endpoint found."
+
+      - name: Check repository files
         run: |
           set -euo pipefail
 
@@ -57,21 +79,18 @@ jobs:
             "lambdas/worker/package.json"
             "lambdas/analytics/index.js"
             "lambdas/analytics/package.json"
-            "lambdas/database-init/index.js"
-            "lambdas/database-init/package.json"
-            "lambdas/database-init/schema.sql"
           )
 
           for file in "${required_files[@]}"; do
-            if [ ! -f "$file" ]; then
-              echo "ERROR: Required file not found: $file"
+            if [ ! -f "${file}" ]; then
+              echo "ERROR: Missing required file: ${file}"
               exit 1
             fi
           done
 
-          echo "All required Stack 2 files are present."
+          echo "All Stack 2 files are present."
 
-      - name: Read Stack 1 outputs
+      - name: Read artifact bucket from Stack 1
         id: infrastructure
         run: |
           set -euo pipefail
@@ -82,76 +101,54 @@ jobs:
             --query "Stacks[0].Outputs[?OutputKey=='LambdaArtifactBucketName'].OutputValue | [0]" \
             --output text)
 
-          READ_REPLICA_ENDPOINT=$(aws cloudformation describe-stacks \
-            --stack-name "${INFRASTRUCTURE_STACK_NAME}" \
-            --region "${AWS_REGION}" \
-            --query "Stacks[0].Outputs[?OutputKey=='ReadReplicaEndpoint'].OutputValue | [0]" \
-            --output text)
-
-          if [ -z "$ARTIFACT_BUCKET" ] || [ "$ARTIFACT_BUCKET" = "None" ]; then
+          if [ -z "${ARTIFACT_BUCKET}" ] || [ "${ARTIFACT_BUCKET}" = "None" ]; then
             echo "ERROR: LambdaArtifactBucketName was not found in Stack 1 outputs."
             exit 1
           fi
 
-          if [ -z "$READ_REPLICA_ENDPOINT" ] || [ "$READ_REPLICA_ENDPOINT" = "None" ]; then
-            echo "ERROR: ReadReplicaEndpoint was not found. Confirm Stack 1 was updated with CreateReadReplica=true."
-            exit 1
-          fi
-
-          echo "artifact_bucket=$ARTIFACT_BUCKET" >> "$GITHUB_OUTPUT"
-          echo "Read replica endpoint found: $READ_REPLICA_ENDPOINT"
+          echo "artifact_bucket=${ARTIFACT_BUCKET}" >> "${GITHUB_OUTPUT}"
+          echo "Artifact bucket found."
 
       - name: Package Lambda functions
         run: |
           set -euo pipefail
+          mkdir -p build
 
-          rm -rf build
-          mkdir -p build/packages
-
-          functions=(api worker analytics database-init)
-
-          for function_name in "${functions[@]}"; do
-            echo "Packaging ${function_name}..."
-            mkdir -p "build/packages/${function_name}"
-            cp -R "lambdas/${function_name}/." "build/packages/${function_name}/"
-
-            pushd "build/packages/${function_name}" >/dev/null
+          package_lambda() {
+            local lambda_name="$1"
+            pushd "lambdas/${lambda_name}" > /dev/null
+            rm -rf node_modules package-lock.json
             npm install --omit=dev --no-audit --no-fund
-            zip -qr "../../${function_name}.zip" .
-            popd >/dev/null
-          done
+            zip -qr "../../build/${lambda_name}.zip" .
+            popd > /dev/null
+          }
 
-          ls -lh build/*.zip
+          package_lambda api
+          package_lambda worker
+          package_lambda analytics
 
-      - name: Upload Lambda packages to Stack 1 artifact bucket
+          echo "Created Lambda packages:"
+          ls -lh build
+
+      - name: Upload Lambda packages to S3
         id: packages
         env:
           ARTIFACT_BUCKET: ${{ steps.infrastructure.outputs.artifact_bucket }}
         run: |
           set -euo pipefail
 
-          PACKAGE_PREFIX="stack2/${GITHUB_SHA}"
+          PREFIX="stack2-602az/${GITHUB_SHA}"
+          API_KEY="${PREFIX}/api.zip"
+          WORKER_KEY="${PREFIX}/worker.zip"
+          ANALYTICS_KEY="${PREFIX}/analytics.zip"
 
-          aws s3 cp build/api.zip \
-            "s3://${ARTIFACT_BUCKET}/${PACKAGE_PREFIX}/api.zip" \
-            --region "${AWS_REGION}"
+          aws s3 cp build/api.zip "s3://${ARTIFACT_BUCKET}/${API_KEY}" --region "${AWS_REGION}"
+          aws s3 cp build/worker.zip "s3://${ARTIFACT_BUCKET}/${WORKER_KEY}" --region "${AWS_REGION}"
+          aws s3 cp build/analytics.zip "s3://${ARTIFACT_BUCKET}/${ANALYTICS_KEY}" --region "${AWS_REGION}"
 
-          aws s3 cp build/worker.zip \
-            "s3://${ARTIFACT_BUCKET}/${PACKAGE_PREFIX}/worker.zip" \
-            --region "${AWS_REGION}"
-
-          aws s3 cp build/analytics.zip \
-            "s3://${ARTIFACT_BUCKET}/${PACKAGE_PREFIX}/analytics.zip" \
-            --region "${AWS_REGION}"
-
-          aws s3 cp build/database-init.zip \
-            "s3://${ARTIFACT_BUCKET}/${PACKAGE_PREFIX}/database-init.zip" \
-            --region "${AWS_REGION}"
-
-          echo "api_key=${PACKAGE_PREFIX}/api.zip" >> "$GITHUB_OUTPUT"
-          echo "worker_key=${PACKAGE_PREFIX}/worker.zip" >> "$GITHUB_OUTPUT"
-          echo "analytics_key=${PACKAGE_PREFIX}/analytics.zip" >> "$GITHUB_OUTPUT"
-          echo "database_init_key=${PACKAGE_PREFIX}/database-init.zip" >> "$GITHUB_OUTPUT"
+          echo "api_key=${API_KEY}" >> "${GITHUB_OUTPUT}"
+          echo "worker_key=${WORKER_KEY}" >> "${GITHUB_OUTPUT}"
+          echo "analytics_key=${ANALYTICS_KEY}" >> "${GITHUB_OUTPUT}"
 
       - name: Validate Stack 2 template
         run: |
@@ -159,7 +156,7 @@ jobs:
             --template-body "file://${TEMPLATE_FILE}" \
             --region "${AWS_REGION}"
 
-      - name: Deploy Stack 2 application
+      - name: Deploy Stack 2
         run: |
           set -euo pipefail
 
@@ -172,50 +169,39 @@ jobs:
               ProjectName=fairwork-pulse \
               EnvironmentName=poc \
               ApiStageName=poc \
-              AllowedOrigin=http://localhost:3000 \
+              AllowedOrigin="${ALLOWED_ORIGIN}" \
               LambdaRuntime="${LAMBDA_RUNTIME}" \
               ApiLambdaS3Key="${{ steps.packages.outputs.api_key }}" \
               WorkerLambdaS3Key="${{ steps.packages.outputs.worker_key }}" \
               AnalyticsLambdaS3Key="${{ steps.packages.outputs.analytics_key }}" \
-              DatabaseInitLambdaS3Key="${{ steps.packages.outputs.database_init_key }}" \
               DeploymentVersion="${GITHUB_SHA}" \
               AnalyticsScheduleExpression="rate(1 day)" \
               LogRetentionDays=14 \
             --tags \
               Project=FairWorkPulse \
               Environment=PoC \
+              Module=602AZ \
               ManagedBy=CloudFormation \
             --no-fail-on-empty-changeset
-
-      - name: Run database schema initialisation
-        run: |
-          set -euo pipefail
-
-          DATABASE_INIT_FUNCTION=$(aws cloudformation describe-stacks \
-            --stack-name "${APPLICATION_STACK_NAME}" \
-            --region "${AWS_REGION}" \
-            --query "Stacks[0].Outputs[?OutputKey=='DatabaseInitFunctionName'].OutputValue | [0]" \
-            --output text)
-
-          INVOKE_RESULT=$(aws lambda invoke \
-            --function-name "${DATABASE_INIT_FUNCTION}" \
-            --payload '{}' \
-            --cli-binary-format raw-in-base64-out \
-            --region "${AWS_REGION}" \
-            build/database-init-response.json)
-
-          echo "$INVOKE_RESULT"
-          cat build/database-init-response.json
-
-          if echo "$INVOKE_RESULT" | grep -q 'FunctionError'; then
-            echo "ERROR: Database initialisation Lambda returned FunctionError."
-            exit 1
-          fi
 
       - name: Display Stack 2 outputs
         run: |
           aws cloudformation describe-stacks \
             --stack-name "${APPLICATION_STACK_NAME}" \
             --region "${AWS_REGION}" \
-            --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
+
+      - name: Test public health endpoint
+        run: |
+          set -euo pipefail
+
+          HEALTH_URL=$(aws cloudformation describe-stacks \
+            --stack-name "${APPLICATION_STACK_NAME}" \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='HealthUrl'].OutputValue | [0]" \
+            --output text)
+
+          echo "Testing ${HEALTH_URL}"
+          curl --fail --show-error --silent "${HEALTH_URL}"
+          echo
