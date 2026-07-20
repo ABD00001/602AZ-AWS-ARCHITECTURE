@@ -1,15 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
 Description: >
-  FairWork Pulse Stack 2. Imports networking, database, encryption, artifact
-  bucket, and LabRole outputs from Stack 1. Creates Cognito authentication
-  for employee, employer, and administrator users, API Gateway,
-  API/worker/analytics/database-init Lambda functions, SQS with a
-  dead-letter queue, SNS alerts, an optional SES identity, EventBridge
-  scheduling, log groups, and CloudWatch alarms.
+  FairWork Pulse Stack 2 for the 602AZ architecture proof of concept. Imports
+  the network, database, KMS key, secret, artifact bucket, and LabRole from
+  Stack 1. Creates Cognito authentication, a REST API, a small API Lambda,
+  SQS with a dead-letter queue, a worker Lambda, a scheduled analytics Lambda
+  that reads the RDS replica, CloudWatch log groups and alarms, and an SNS
+  operational-alert topic. The complete FairWork business application and
+  Next.js frontend are intentionally left for the following implementation module.
 
 Parameters:
-
   InfrastructureStackName:
     Type: String
     Default: fairwork-infrastructure
@@ -33,45 +33,41 @@ Parameters:
   AllowedOrigin:
     Type: String
     Default: http://localhost:3000
-    Description: Frontend origin allowed by API CORS responses.
+    Description: Next.js origin permitted by CORS during local development.
 
   LambdaRuntime:
     Type: String
     Default: nodejs18.x
     AllowedValues:
       - nodejs18.x
-    Description: Node.js 18 runtime selected for the AWS Academy lab.
+    Description: Node.js 18 is used because it is supported by the AWS Academy lab.
 
   ApiLambdaS3Key:
     Type: String
+    Description: S3 object key of the API Lambda ZIP package.
 
   WorkerLambdaS3Key:
     Type: String
+    Description: S3 object key of the worker Lambda ZIP package.
 
   AnalyticsLambdaS3Key:
     Type: String
-
-  DatabaseInitLambdaS3Key:
-    Type: String
+    Description: S3 object key of the analytics Lambda ZIP package.
 
   DeploymentVersion:
     Type: String
     Default: initial
-    Description: Git commit SHA or another value used to refresh API deployment.
+    Description: Commit SHA used to force a new API Gateway deployment.
 
   AnalyticsScheduleExpression:
     Type: String
     Default: rate(1 day)
+    Description: EventBridge schedule for the replica connectivity demonstration.
 
   AdminNotificationEmail:
     Type: String
     Default: ''
-    Description: Optional email endpoint for SNS operational alerts.
-
-  SesFromEmail:
-    Type: String
-    Default: ''
-    Description: Optional SES sender address. Verification is required.
+    Description: Optional email subscription for operational SNS alerts.
 
   LogRetentionDays:
     Type: Number
@@ -84,23 +80,15 @@ Parameters:
       - 90
 
 Conditions:
-
   HasAdminNotificationEmail: !Not
     - !Equals
       - !Ref AdminNotificationEmail
       - ''
 
-  HasSesFromEmail: !Not
-    - !Equals
-      - !Ref SesFromEmail
-      - ''
-
 Resources:
-
-  # ==========================================================================
-  # COGNITO AUTHENTICATION
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # Cognito: authentication foundation for the future Next.js frontend
+  # ---------------------------------------------------------------------------
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -135,7 +123,7 @@ Resources:
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
-      ClientName: !Sub '${ProjectName}-${EnvironmentName}-web-client'
+      ClientName: !Sub '${ProjectName}-${EnvironmentName}-nextjs-client'
       UserPoolId: !Ref UserPool
       GenerateSecret: false
       PreventUserExistenceErrors: ENABLED
@@ -174,18 +162,17 @@ Resources:
     Type: AWS::Cognito::UserPoolGroup
     Properties:
       GroupName: ADMINISTRATOR
-      Description: FairWork Pulse administrators
+      Description: FairWork Pulse administrator users
       Precedence: 10
       UserPoolId: !Ref UserPool
 
-  # ==========================================================================
-  # SQS AND SNS
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # SQS: asynchronous architecture demonstration
+  # ---------------------------------------------------------------------------
   DeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectName}-${EnvironmentName}-jobs-dlq'
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-demo-dlq'
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
       Tags:
@@ -197,8 +184,8 @@ Resources:
   JobQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${ProjectName}-${EnvironmentName}-jobs'
-      VisibilityTimeout: 360
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-demo-jobs'
+      VisibilityTimeout: 180
       MessageRetentionPeriod: 345600
       ReceiveMessageWaitTimeSeconds: 20
       SqsManagedSseEnabled: true
@@ -214,8 +201,8 @@ Resources:
   AlertTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: !Sub '${ProjectName}-${EnvironmentName}-alerts'
-      DisplayName: FairWork Pulse alerts
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-architecture-alerts'
+      DisplayName: FairWork architecture alerts
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -230,97 +217,68 @@ Resources:
       Protocol: email
       Endpoint: !Ref AdminNotificationEmail
 
-  SesEmailIdentity:
-    Condition: HasSesFromEmail
-    Type: AWS::SES::EmailIdentity
-    Properties:
-      EmailIdentity: !Ref SesFromEmail
-
-  # ==========================================================================
-  # CLOUDWATCH LOG GROUPS
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # CloudWatch log groups
+  # ---------------------------------------------------------------------------
   ApiFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-api'
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-api-demo'
       RetentionInDays: !Ref LogRetentionDays
 
   WorkerFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-worker'
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-worker-demo'
       RetentionInDays: !Ref LogRetentionDays
 
   AnalyticsFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-analytics'
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-analytics-demo'
       RetentionInDays: !Ref LogRetentionDays
 
-  DatabaseInitFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-database-init'
-      RetentionInDays: !Ref LogRetentionDays
-
-  # ==========================================================================
-  # LAMBDA FUNCTIONS
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # Lambda functions. Code is packaged separately and uploaded to Stack 1 S3.
+  # ---------------------------------------------------------------------------
   ApiFunction:
     Type: AWS::Lambda::Function
     DependsOn:
       - ApiFunctionLogGroup
     Properties:
-      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-api'
-      Description: Main FairWork Pulse REST API backend
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-api-demo'
+      Description: 602AZ API, private RDS, Secrets Manager, and SQS integration demo
       Runtime: !Ref LambdaRuntime
       Handler: index.handler
       Architectures:
         - x86_64
       Role:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-LabRoleArn'
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-LabRoleArn'
       Code:
         S3Bucket:
-          Fn::ImportValue:
-            !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
+          Fn::ImportValue: !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
         S3Key: !Ref ApiLambdaS3Key
-      MemorySize: 512
+      MemorySize: 256
       Timeout: 30
       KmsKeyArn:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-KmsKeyArn'
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-KmsKeyArn'
       VpcConfig:
         SecurityGroupIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
         SubnetIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
       Environment:
         Variables:
           DB_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseEndpoint'
-          DB_READ_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-ReadReplicaEndpoint'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabaseEndpoint'
           DB_PORT:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabasePort'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabasePort'
           DB_NAME:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseName'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabaseName'
           DB_SECRET_ARN:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseSecretArn'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabaseSecretArn'
           JOB_QUEUE_URL: !Ref JobQueue
-          ALERT_TOPIC_ARN: !Ref AlertTopic
-          USER_POOL_ID: !Ref UserPool
           ALLOWED_ORIGIN: !Ref AllowedOrigin
           NODE_OPTIONS: '--enable-source-maps'
       Tags:
@@ -334,50 +292,23 @@ Resources:
     DependsOn:
       - WorkerFunctionLogGroup
     Properties:
-      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-worker'
-      Description: Processes FairWork Pulse background SQS jobs
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-worker-demo'
+      Description: 602AZ SQS worker and retry/dead-letter demonstration
       Runtime: !Ref LambdaRuntime
       Handler: index.handler
       Architectures:
         - x86_64
       Role:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-LabRoleArn'
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-LabRoleArn'
       Code:
         S3Bucket:
-          Fn::ImportValue:
-            !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
+          Fn::ImportValue: !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
         S3Key: !Ref WorkerLambdaS3Key
-      MemorySize: 256
-      Timeout: 60
-      KmsKeyArn:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-KmsKeyArn'
-      VpcConfig:
-        SecurityGroupIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
-        SubnetIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
+      MemorySize: 128
+      Timeout: 30
       Environment:
         Variables:
-          DB_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseEndpoint'
-          DB_PORT:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabasePort'
-          DB_NAME:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseName'
-          DB_SECRET_ARN:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseSecretArn'
-          ALERT_TOPIC_ARN: !Ref AlertTopic
-          SES_FROM_EMAIL: !Ref SesFromEmail
+          PROJECT_NAME: !Ref ProjectName
           NODE_OPTIONS: '--enable-source-maps'
       Tags:
         - Key: Project
@@ -390,105 +321,38 @@ Resources:
     DependsOn:
       - AnalyticsFunctionLogGroup
     Properties:
-      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-analytics'
-      Description: Calculates aggregated FairWork Pulse analytics
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-analytics-demo'
+      Description: 602AZ scheduled RDS read-replica connectivity demonstration
       Runtime: !Ref LambdaRuntime
       Handler: index.handler
       Architectures:
         - x86_64
       Role:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-LabRoleArn'
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-LabRoleArn'
       Code:
         S3Bucket:
-          Fn::ImportValue:
-            !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
+          Fn::ImportValue: !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
         S3Key: !Ref AnalyticsLambdaS3Key
-      MemorySize: 512
-      Timeout: 300
-      KmsKeyArn:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-KmsKeyArn'
-      VpcConfig:
-        SecurityGroupIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
-        SubnetIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
-      Environment:
-        Variables:
-          DB_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseEndpoint'
-          DB_READ_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-ReadReplicaEndpoint'
-          DB_PORT:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabasePort'
-          DB_NAME:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseName'
-          DB_SECRET_ARN:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseSecretArn'
-          NODE_OPTIONS: '--enable-source-maps'
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Environment
-          Value: !Ref EnvironmentName
-
-  DatabaseInitFunction:
-    Type: AWS::Lambda::Function
-    DependsOn:
-      - DatabaseInitFunctionLogGroup
-    Properties:
-      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-database-init'
-      Description: Creates or updates the FairWork Pulse database schema
-      Runtime: !Ref LambdaRuntime
-      Handler: index.handler
-      Architectures:
-        - x86_64
-      Role:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-LabRoleArn'
-      Code:
-        S3Bucket:
-          Fn::ImportValue:
-            !Sub '${InfrastructureStackName}-LambdaArtifactBucketName'
-        S3Key: !Ref DatabaseInitLambdaS3Key
       MemorySize: 256
-      Timeout: 300
+      Timeout: 30
       KmsKeyArn:
-        Fn::ImportValue:
-          !Sub '${InfrastructureStackName}-KmsKeyArn'
+        Fn::ImportValue: !Sub '${InfrastructureStackName}-KmsKeyArn'
       VpcConfig:
         SecurityGroupIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-LambdaSecurityGroupId'
         SubnetIds:
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
-          - Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-PrivateAppSubnetAId'
+          - Fn::ImportValue: !Sub '${InfrastructureStackName}-PrivateAppSubnetBId'
       Environment:
         Variables:
-          DB_HOST:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseEndpoint'
+          DB_READ_HOST:
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-ReadReplicaEndpoint'
           DB_PORT:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabasePort'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabasePort'
           DB_NAME:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseName'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabaseName'
           DB_SECRET_ARN:
-            Fn::ImportValue:
-              !Sub '${InfrastructureStackName}-DatabaseSecretArn'
+            Fn::ImportValue: !Sub '${InfrastructureStackName}-DatabaseSecretArn'
           NODE_OPTIONS: '--enable-source-maps'
       Tags:
         - Key: Project
@@ -507,15 +371,14 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
-  # ==========================================================================
-  # API GATEWAY
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # API Gateway REST API
+  # ---------------------------------------------------------------------------
   RestApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: !Sub '${ProjectName}-${EnvironmentName}-api'
-      Description: FairWork Pulse REST API
+      Name: !Sub '${ProjectName}-${EnvironmentName}-architecture-api'
+      Description: 602AZ FairWork Pulse architecture demonstration API
       EndpointConfiguration:
         Types:
           - REGIONAL
@@ -542,6 +405,20 @@ Resources:
       ParentId: !GetAtt RestApi.RootResourceId
       PathPart: health
 
+  DatabaseHealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: database-health
+
+  QueueTestResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: queue-test
+
   HealthGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -556,19 +433,12 @@ Resources:
           - 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
           - FunctionArn: !GetAtt ApiFunction.Arn
 
-  ProxyResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref RestApi
-      ParentId: !GetAtt RestApi.RootResourceId
-      PathPart: '{proxy+}'
-
-  ProxyAnyMethod:
+  DatabaseHealthGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref RestApi
-      ResourceId: !Ref ProxyResource
-      HttpMethod: ANY
+      ResourceId: !Ref DatabaseHealthResource
+      HttpMethod: GET
       AuthorizationType: COGNITO_USER_POOLS
       AuthorizerId: !Ref CognitoAuthorizer
       Integration:
@@ -578,11 +448,26 @@ Resources:
           - 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
           - FunctionArn: !GetAtt ApiFunction.Arn
 
-  ProxyOptionsMethod:
+  QueueTestPostMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref RestApi
-      ResourceId: !Ref ProxyResource
+      ResourceId: !Ref QueueTestResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - FunctionArn: !GetAtt ApiFunction.Arn
+
+  HealthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HealthResource
       HttpMethod: OPTIONS
       AuthorizationType: NONE
       Integration:
@@ -592,8 +477,56 @@ Resources:
         IntegrationResponses:
           - StatusCode: 200
             ResponseParameters:
-              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
-              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DatabaseHealthOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref DatabaseHealthResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  QueueTestOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref QueueTestResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
               method.response.header.Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
       MethodResponses:
         - StatusCode: 200
@@ -614,11 +547,14 @@ Resources:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
       - HealthGetMethod
-      - ProxyAnyMethod
-      - ProxyOptionsMethod
+      - DatabaseHealthGetMethod
+      - QueueTestPostMethod
+      - HealthOptionsMethod
+      - DatabaseHealthOptionsMethod
+      - QueueTestOptionsMethod
     Properties:
       RestApiId: !Ref RestApi
-      Description: !Sub 'FairWork Pulse API deployment ${DeploymentVersion}'
+      Description: !Sub '602AZ deployment ${DeploymentVersion}'
 
   ApiStage:
     Type: AWS::ApiGateway::Stage
@@ -626,29 +562,33 @@ Resources:
       RestApiId: !Ref RestApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref ApiStageName
-      Description: !Sub '${ProjectName} ${EnvironmentName} stage'
-      TracingEnabled: false
+      Description: 602AZ proof-of-concept stage
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          DataTraceEnabled: false
+          LoggingLevel: OFF
       Tags:
         - Key: Project
           Value: !Ref ProjectName
         - Key: Environment
           Value: !Ref EnvironmentName
 
-  # ==========================================================================
-  # EVENTBRIDGE ANALYTICS SCHEDULE
-  # ==========================================================================
-
+  # ---------------------------------------------------------------------------
+  # EventBridge schedule for the replica demonstration
+  # ---------------------------------------------------------------------------
   AnalyticsScheduleRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub '${ProjectName}-${EnvironmentName}-analytics-schedule'
-      Description: Runs FairWork Pulse aggregate analytics
+      Name: !Sub '${ProjectName}-${EnvironmentName}-replica-check'
+      Description: Runs a scheduled connectivity check against the RDS read replica
       ScheduleExpression: !Ref AnalyticsScheduleExpression
       State: ENABLED
       Targets:
         - Arn: !GetAtt AnalyticsFunction.Arn
-          Id: AnalyticsLambdaTarget
-          Input: '{"source":"eventbridge","action":"RUN_ANALYTICS"}'
+          Id: AnalyticsFunctionTarget
 
   AnalyticsInvokePermission:
     Type: AWS::Lambda::Permission
@@ -658,15 +598,14 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AnalyticsScheduleRule.Arn
 
-  # ==========================================================================
-  # CLOUDWATCH ALARMS
-  # ==========================================================================
-
-  ApiFunctionErrorsAlarm:
+  # ---------------------------------------------------------------------------
+  # CloudWatch alarms
+  # ---------------------------------------------------------------------------
+  ApiErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${ProjectName}-${EnvironmentName}-api-errors'
-      AlarmDescription: API Lambda returned one or more errors
+      AlarmDescription: API Lambda returned one or more errors in five minutes
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
@@ -682,11 +621,11 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
-  WorkerFunctionErrorsAlarm:
+  WorkerErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${ProjectName}-${EnvironmentName}-worker-errors'
-      AlarmDescription: Worker Lambda returned one or more errors
+      AlarmDescription: Worker Lambda returned one or more errors in five minutes
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
@@ -702,17 +641,17 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
-  DeadLetterQueueAlarm:
+  AnalyticsErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-dlq-messages'
-      AlarmDescription: One or more background jobs reached the dead-letter queue
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-analytics-errors'
+      AlarmDescription: Scheduled read-replica check returned an error
+      Namespace: AWS/Lambda
+      MetricName: Errors
       Dimensions:
-        - Name: QueueName
-          Value: !GetAtt DeadLetterQueue.QueueName
-      Statistic: Maximum
+        - Name: FunctionName
+          Value: !Ref AnalyticsFunction
+      Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
       DatapointsToAlarm: 1
@@ -722,34 +661,57 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-dlq-visible-messages'
+      AlarmDescription: A demonstration message reached the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
 Outputs:
+  AwsRegion:
+    Value: !Ref AWS::Region
 
   ApiUrl:
-    Description: Base URL for the FairWork Pulse REST API.
+    Description: Base URL used by the future Next.js frontend.
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}'
 
   HealthUrl:
-    Description: Public API health endpoint.
+    Description: Public architecture health-check endpoint.
     Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}/health'
 
-  RestApiId:
-    Value: !Ref RestApi
+  DatabaseHealthUrl:
+    Description: Cognito-protected primary RDS connectivity endpoint.
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}/database-health'
+
+  QueueTestUrl:
+    Description: Cognito-protected SQS test endpoint.
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}/queue-test'
 
   UserPoolId:
     Value: !Ref UserPool
 
-  UserPoolArn:
-    Value: !GetAtt UserPool.Arn
-
   UserPoolClientId:
     Value: !Ref UserPoolClient
 
-  ConfiguredUserGroups:
-    Description: Cognito groups created by this application stack.
-    Value: EMPLOYEE,EMPLOYER,ADMINISTRATOR
-
   CognitoIssuerUrl:
     Value: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+
+  ConfiguredUserGroups:
+    Value: EMPLOYEE,EMPLOYER,ADMINISTRATOR
 
   JobQueueUrl:
     Value: !Ref JobQueue
@@ -768,6 +730,3 @@ Outputs:
 
   AnalyticsFunctionName:
     Value: !Ref AnalyticsFunction
-
-  DatabaseInitFunctionName:
-    Value: !Ref DatabaseInitFunction
