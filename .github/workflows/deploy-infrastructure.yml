@@ -22,15 +22,11 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # -----------------------------------------------------------------------
       # Download the repository files onto the GitHub Actions runner
-      # -----------------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # Configure the temporary AWS Academy credentials
-      # -----------------------------------------------------------------------
+      # Configure temporary AWS Academy credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -40,16 +36,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
-      # -----------------------------------------------------------------------
-      # Confirm that GitHub Actions is connected to the expected AWS account
-      # -----------------------------------------------------------------------
+      # Confirm connection to AWS
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # -----------------------------------------------------------------------
-      # Confirm that the CloudFormation file exists
-      # -----------------------------------------------------------------------
+      # Confirm that the CloudFormation template exists
       - name: Check template file
         run: |
           echo "Repository files:"
@@ -62,18 +54,14 @@ jobs:
 
           echo "Template found: ${TEMPLATE_FILE}"
 
-      # -----------------------------------------------------------------------
-      # Check the basic CloudFormation syntax before deployment
-      # -----------------------------------------------------------------------
+      # Validate the CloudFormation template
       - name: Validate CloudFormation template
         run: |
           aws cloudformation validate-template \
             --template-body "file://${TEMPLATE_FILE}" \
             --region "${AWS_REGION}"
 
-      # -----------------------------------------------------------------------
-      # Create or update the FairWork Pulse infrastructure stack
-      # -----------------------------------------------------------------------
+      # Update the existing infrastructure stack and create the read replica
       - name: Deploy infrastructure stack
         run: |
           set -euo pipefail
@@ -91,7 +79,7 @@ jobs:
               DatabaseInstanceClass=db.t3.micro \
               DatabaseAllocatedStorage=20 \
               BackupRetentionDays=7 \
-              CreateReadReplica=false \
+              CreateReadReplica=true \
               EnableDeletionProtection=false \
             --tags \
               Project=FairWorkPulse \
@@ -99,9 +87,7 @@ jobs:
               ManagedBy=CloudFormation \
             --no-fail-on-empty-changeset
 
-      # -----------------------------------------------------------------------
-      # Display values that Stack 2 will import
-      # -----------------------------------------------------------------------
+      # Display outputs required by Stack 2
       - name: Display stack outputs
         run: |
           aws cloudformation describe-stacks \
