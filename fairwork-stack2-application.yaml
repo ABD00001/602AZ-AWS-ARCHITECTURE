@@ -2,8 +2,9 @@ AWSTemplateFormatVersion: '2010-09-09'
 
 Description: >
   FairWork Pulse Stack 2. Imports networking, database, encryption, artifact
-  bucket, and LabRole outputs from Stack 1. Creates Cognito authentication,
-  API Gateway, API/worker/analytics/database-init Lambda functions, SQS with a
+  bucket, and LabRole outputs from Stack 1. Creates Cognito authentication
+  for employee, employer, and administrator users, API Gateway,
+  API/worker/analytics/database-init Lambda functions, SQS with a
   dead-letter queue, SNS alerts, an optional SES identity, EventBridge
   scheduling, log groups, and CloudWatch alarms.
 
@@ -36,14 +37,10 @@ Parameters:
 
   LambdaRuntime:
     Type: String
-    Default: nodejs22.x
+    Default: nodejs18.x
     AllowedValues:
-      - nodejs22.x
-      - nodejs24.x
       - nodejs18.x
-    Description: >
-      nodejs22.x is recommended. nodejs18.x remains available only as a
-      temporary AWS Academy compatibility option.
+    Description: Node.js 18 runtime selected for the AWS Academy lab.
 
   ApiLambdaS3Key:
     Type: String
@@ -162,7 +159,7 @@ Resources:
     Properties:
       GroupName: EMPLOYEE
       Description: FairWork Pulse employee users
-      Precedence: 40
+      Precedence: 30
       UserPoolId: !Ref UserPool
 
   EmployerGroup:
@@ -170,14 +167,6 @@ Resources:
     Properties:
       GroupName: EMPLOYER
       Description: FairWork Pulse employer users
-      Precedence: 30
-      UserPoolId: !Ref UserPool
-
-  ModeratorGroup:
-    Type: AWS::Cognito::UserPoolGroup
-    Properties:
-      GroupName: MODERATOR
-      Description: FairWork Pulse content moderators
       Precedence: 20
       UserPoolId: !Ref UserPool
 
@@ -754,6 +743,10 @@ Outputs:
 
   UserPoolClientId:
     Value: !Ref UserPoolClient
+
+  ConfiguredUserGroups:
+    Description: Cognito groups created by this application stack.
+    Value: EMPLOYEE,EMPLOYER,ADMINISTRATOR
 
   CognitoIssuerUrl:
     Value: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
