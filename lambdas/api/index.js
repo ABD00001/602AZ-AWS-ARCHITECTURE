@@ -5,222 +5,160 @@ const {
   SecretsManagerClient,
   GetSecretValueCommand,
 } = require('@aws-sdk/client-secrets-manager');
+const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 
 const secretsClient = new SecretsManagerClient({});
+const sqsClient = new SQSClient({});
+
 let cachedSecret;
-let primaryPool;
-let readPool;
+let databasePool;
+
+function buildResponse(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': process.env.ALLOWED_ORIGIN,
+      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    },
+    body: JSON.stringify(body),
+  };
+}
 
 async function getDatabaseSecret() {
-  if (cachedSecret) return cachedSecret;
+  if (cachedSecret) {
+    return cachedSecret;
+  }
 
   const result = await secretsClient.send(
     new GetSecretValueCommand({ SecretId: process.env.DB_SECRET_ARN }),
   );
 
   if (!result.SecretString) {
-    throw new Error('Database secret did not contain SecretString.');
+    throw new Error('The database secret did not contain a SecretString value.');
   }
 
   cachedSecret = JSON.parse(result.SecretString);
   return cachedSecret;
 }
 
-async function createPool(host) {
+async function getDatabasePool() {
+  if (databasePool) {
+    return databasePool;
+  }
+
   const secret = await getDatabaseSecret();
-  return mysql.createPool({
-    host,
+
+  databasePool = mysql.createPool({
+    host: process.env.DB_HOST,
     port: Number(process.env.DB_PORT || 3306),
     database: process.env.DB_NAME,
     user: secret.username,
     password: secret.password,
     waitForConnections: true,
-    connectionLimit: 3,
-    queueLimit: 10,
+    connectionLimit: 2,
+    queueLimit: 0,
     enableKeepAlive: true,
-    ssl: { rejectUnauthorized: true },
+  });
+
+  return databasePool;
+}
+
+function getClaims(event) {
+  return event.requestContext?.authorizer?.claims || {};
+}
+
+async function checkDatabase() {
+  const pool = await getDatabasePool();
+  const [rows] = await pool.query(
+    'SELECT 1 AS connection_ok, DATABASE() AS database_name, NOW() AS database_time',
+  );
+
+  return rows[0];
+}
+
+async function sendQueueTest(event) {
+  let requestBody = {};
+
+  if (event.body) {
+    try {
+      requestBody = JSON.parse(event.body);
+    } catch {
+      return buildResponse(400, { message: 'The request body must be valid JSON.' });
+    }
+  }
+
+  const claims = getClaims(event);
+  const job = {
+    jobId: `demo-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    type: 'ARCHITECTURE_DEMO',
+    createdAt: new Date().toISOString(),
+    requestedBy: claims.sub || 'authenticated-user',
+    userGroups: claims['cognito:groups'] || '',
+    message: requestBody.message || 'FairWork Pulse SQS integration test',
+    forceFailure: requestBody.forceFailure === true,
+  };
+
+  const result = await sqsClient.send(
+    new SendMessageCommand({
+      QueueUrl: process.env.JOB_QUEUE_URL,
+      MessageBody: JSON.stringify(job),
+    }),
+  );
+
+  return buildResponse(202, {
+    message: 'The demonstration message was accepted by SQS.',
+    jobId: job.jobId,
+    sqsMessageId: result.MessageId,
+    forceFailure: job.forceFailure,
   });
 }
 
-async function getPrimaryPool() {
-  if (!primaryPool) primaryPool = await createPool(process.env.DB_HOST);
-  return primaryPool;
-}
+exports.handler = async (event) => {
+  const method = event.httpMethod;
+  const path = event.resource || event.path;
 
-async function getReadPool() {
-  if (!readPool) {
-    readPool = await createPool(
-      process.env.DB_READ_HOST || process.env.DB_HOST,
-    );
-  }
-  return readPool;
-}
-
-function monthPeriod() {
-  const now = new Date();
-  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0));
-  return {
-    start: start.toISOString().slice(0, 10),
-    end: end.toISOString().slice(0, 10),
-  };
-}
-
-async function upsertMetric(
-  connection,
-  companyId,
-  metricName,
-  metricValue,
-  periodStart,
-  periodEnd,
-  metadata = {},
-) {
-  await connection.execute(
-    `INSERT INTO analytics_summaries
-       (company_id, metric_name, metric_value, period_start, period_end, metadata_json)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       metric_value = VALUES(metric_value),
-       metadata_json = VALUES(metadata_json),
-       updated_at = UTC_TIMESTAMP()`,
-    [
-      companyId,
-      metricName,
-      metricValue,
-      periodStart,
-      periodEnd,
-      JSON.stringify(metadata),
-    ],
-  );
-}
-
-exports.handler = async () => {
-  const readDb = await getReadPool();
-  const writeDb = await getPrimaryPool();
-  const period = monthPeriod();
-
-  const [reviewRows] = await readDb.execute(
-    `SELECT
-       company_id,
-       COUNT(*) AS review_count,
-       ROUND(AVG(rating), 2) AS average_rating
-     FROM reviews
-     WHERE status = 'APPROVED'
-       AND created_at >= ?
-       AND created_at < DATE_ADD(?, INTERVAL 1 DAY)
-     GROUP BY company_id`,
-    [period.start, period.end],
-  );
-
-  const [wellbeingRows] = await readDb.execute(
-    `SELECT
-       company_id,
-       COUNT(*) AS checkin_count,
-       ROUND(AVG(workload_score), 2) AS average_workload,
-       ROUND(AVG(stress_score), 2) AS average_stress,
-       ROUND(AVG(support_score), 2) AS average_support
-     FROM wellbeing_checkins
-     WHERE created_at >= ?
-       AND created_at < DATE_ADD(?, INTERVAL 1 DAY)
-     GROUP BY company_id`,
-    [period.start, period.end],
-  );
-
-  const connection = await writeDb.getConnection();
+  console.log('API request received', {
+    method,
+    path,
+    requestId: event.requestContext?.requestId,
+  });
 
   try {
-    await connection.beginTransaction();
-
-    for (const row of reviewRows) {
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'review_count',
-        Number(row.review_count),
-        period.start,
-        period.end,
-      );
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'average_rating',
-        Number(row.average_rating || 0),
-        period.start,
-        period.end,
-      );
+    if (method === 'GET' && path === '/health') {
+      return buildResponse(200, {
+        status: 'ok',
+        service: 'fairwork-pulse-602az-api',
+        timestamp: new Date().toISOString(),
+      });
     }
 
-    for (const row of wellbeingRows) {
-      const workload = Number(row.average_workload || 0);
-      const stress = Number(row.average_stress || 0);
-      const support = Number(row.average_support || 0);
-      const burnoutIndicator = Math.max(
-        0,
-        Math.min(5, Number(((workload + stress + (6 - support)) / 3).toFixed(2))),
-      );
-
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'wellbeing_checkin_count',
-        Number(row.checkin_count),
-        period.start,
-        period.end,
-      );
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'average_workload_score',
-        workload,
-        period.start,
-        period.end,
-      );
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'average_stress_score',
-        stress,
-        period.start,
-        period.end,
-      );
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'average_support_score',
-        support,
-        period.start,
-        period.end,
-      );
-      await upsertMetric(
-        connection,
-        row.company_id,
-        'burnout_indicator',
-        burnoutIndicator,
-        period.start,
-        period.end,
-        {
-          method: 'PoC composite of workload, stress, and inverse support',
-          scale: '0-5',
-        },
-      );
+    if (method === 'GET' && path === '/database-health') {
+      const databaseResult = await checkDatabase();
+      return buildResponse(200, {
+        status: 'ok',
+        connection: 'API Lambda to private RDS primary',
+        database: databaseResult,
+      });
     }
 
-    await connection.commit();
+    if (method === 'POST' && path === '/queue-test') {
+      return await sendQueueTest(event);
+    }
 
-    return {
-      statusCode: 200,
-      period,
-      companiesWithReviews: reviewRows.length,
-      companiesWithCheckins: wellbeingRows.length,
-    };
+    return buildResponse(404, {
+      message: 'Route not found in the 602AZ proof of concept.',
+    });
   } catch (error) {
-    await connection.rollback();
-    console.error('Analytics calculation failed', {
+    console.error('API request failed', {
       name: error.name,
       message: error.message,
     });
-    throw error;
-  } finally {
-    connection.release();
+
+    return buildResponse(500, {
+      message: 'The architecture demonstration request failed.',
+      errorType: error.name,
+    });
   }
 };
