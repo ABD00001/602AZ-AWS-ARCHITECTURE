@@ -15,7 +15,7 @@ env:
   INFRASTRUCTURE_STACK_NAME: fairwork-infrastructure
   APPLICATION_STACK_NAME: fairwork-application
   TEMPLATE_FILE: fairwork-stack2-application.yaml
-  LAMBDA_RUNTIME: nodejs22.x
+  LAMBDA_RUNTIME: nodejs18.x
 
 jobs:
   deploy-application:
@@ -30,7 +30,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '18'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
