@@ -1,0 +1,13 @@
+{
+  "name": "fairwork-pulse-analytics-lambda",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.0.0",
+    "mysql2": "^3.11.0"
+  }
+}
