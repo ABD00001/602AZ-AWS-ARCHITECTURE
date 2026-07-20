@@ -1,0 +1,10 @@
+{
+  "name": "fairwork-pulse-602az-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal SQS worker Lambda for the 602AZ architecture demonstration",
+  "main": "index.js",
+  "engines": {
+    "node": "18.x"
+  }
+}
