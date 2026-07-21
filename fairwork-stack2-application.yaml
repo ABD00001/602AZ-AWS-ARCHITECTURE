@@ -569,7 +569,7 @@ Resources:
           HttpMethod: '*'
           MetricsEnabled: true
           DataTraceEnabled: false
-          LoggingLevel: OFF
+          LoggingLevel: 'OFF'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
