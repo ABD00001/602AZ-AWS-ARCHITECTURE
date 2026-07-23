@@ -199,7 +199,7 @@ jobs:
               WorkerLambdaS3Key="${{ steps.packages.outputs.worker_key }}" \
               AnalyticsLambdaS3Key="${{ steps.packages.outputs.analytics_key }}" \
               DeploymentVersion="${GITHUB_SHA}" \
-              AnalyticsScheduleExpression="rate(1 day)" \
+              AnalyticsScheduleExpression="rate(5 minutes)" \
               LogRetentionDays=14 \
             --tags \
               Project=FairWorkPulse \
