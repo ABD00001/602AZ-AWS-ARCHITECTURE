@@ -1,0 +1,7 @@
+# FairWork Pulse
+
+## Ideal Architecture
+
+<p align="center">
+  <img src="Usable%20architecture.png" alt="FairWork Pulse Ideal Architecture" width="900">
+</p>
